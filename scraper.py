@@ -14,7 +14,7 @@ class Scraper:
     def __init__(self, key, images):
         self.key_file = key
         self.valid_images = images
-        self.sheet = None
+        self.sheet = self.build_sheet()
 
     def build_sheet(self):
         # obtain service credentials
@@ -124,9 +124,56 @@ class Scraper:
         with open(location, "w") as out:
                 out.writelines([",".join([x or "" for x in row]) + "\n" for row in info])
 
-    def main(self, i, o, io_type, sid):
-        self.sheet = self.build_sheet()
+    def scrape_points(self, teams):
+        plot = []
+        for team in teams:
+            base_url = "http://scoreboard.uscyberpatriot.org/" + "team.php?team=" + team
+            response = requests.get(base_url)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                script = soup.find_all('script')[1]
+                data = str(script).split("arrayToDataTable([\n")[1].split("]);")[0].replace("'","").replace("null","")
+                data = [x[1:-2].split(", ") for x in data.split("\r\n")[:-1]]
+                data = [[team]] + data
+            # pad to 80 rows
+            data = data + [[]] * (80 - len(data))
+            plot.extend(data)
+        return plot
 
+    def generate_charts(self, teams, points, sid, gid):
+        """Requires team #, points over time data, spreadsheet ID, AND data sheet ID (gid)"""
+        # clear current points data
+        delreq = {"requests": [{"updateCells": {"range": {"sheetId": gid}, "fields": "userEnteredValue"}}]}
+        result = self.sheet.batchUpdate(spreadsheetId=sid,body=delreq).execute()
+        # add data
+        result = self.sheet.values().update(spreadsheetId=sid,
+                                            range="Graph Data",
+                                            valueInputOption='USER_ENTERED',
+                                            body={'values':points}).execute()
+        # generate charts
+        chreq = []
+        for i, t in enumerate(teams):
+            chreq.append(
+                {"addChart": {"chart": {
+                    "spec": {
+                        "title": t + " scores",
+                        "basicChart": {
+                            "chartType": "LINE",
+                            "legendPosition": "BOTTOM_LEGEND",
+                            "axis": [{"position": "BOTTOM_AXIS", "title": "Time"}, {"position": "LEFT_AXIS", "title": "Points"}],
+                            "domains": [{"domain": {"sourceRange": {"sources": [{"sheetId": gid, "startRowIndex": 80*i, "endRowIndex": 80*i + 80, "startColumnIndex": 0, "endColumnIndex": 1}]}}}],
+                            "series": [{"series":{"sourceRange":{"sources":[{"sheetId": gid, "startRowIndex": 80*i, "endRowIndex": 80*i + 80, "startColumnIndex": x + 1, "endColumnIndex": x + 2}]}}, "targetAxis": "LEFT_AXIS"} for x in range(len(self.valid_images))],
+                            "headerCount": 1
+                        }
+                    },
+                    "position": {
+                        "newSheet": True
+                    }
+                }}}
+            )
+        result = self.sheet.batchUpdate(spreadsheetId=sid,body={"requests": chreq}).execute()
+
+    def main(self, i, o, io_type, sid):
         if io_type & 2:
             teams = self.pull_sheet(i, sid)
         else:
@@ -181,3 +228,12 @@ if __name__ == "__main__":
         sys.exit(2)
     s = Scraper("keys.json", ["Debian9", "Server2019", "Ubuntu18", "Windows10"])
     s.main(input_location, output_location, io_type, sid)
+
+    # generate chart for top team(s)
+    num_top = 1
+    response = requests.get("http://scoreboard.uscyberpatriot.org/")
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table')
+        top = [row.find_all('td')[1].text for row in table.find_all('tr')[1:1+num_top]]
+        s.generate_charts(top, s.scrape_points(top), sid, 123456789)
